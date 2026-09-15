@@ -16,6 +16,7 @@ import (
 
 	"github.com/mpolden/echoip/iputil"
 	"github.com/mpolden/echoip/iputil/geo"
+	"github.com/mpolden/echoip/outbound"
 	"github.com/mpolden/echoip/useragent"
 
 	"math/big"
@@ -33,7 +34,13 @@ type Server struct {
 	Template   string
 	IPHeaders  []string
 	LookupAddr func(net.IP) (string, error)
-	LookupPort func(net.IP, uint64) error
+	// ProbePort tests TCP reachability of dstIP:port on behalf of the
+	// request from srcIP. It is backed by an outbound policy guard which may
+	// reject probes as *outbound.GuardError.
+	ProbePort func(srcIP, dstIP net.IP, port uint64) error
+	// PortStats returns outbound probe metrics. When set, a JSON metrics
+	// endpoint is registered under the profiling handlers.
+	PortStats  func() outbound.Stats
 	cache      *Cache
 	gr         geo.Reader
 	profile    bool
@@ -199,7 +206,18 @@ func (s *Server) newPortResponse(r *http.Request) (PortResponse, error) {
 	if err != nil {
 		return PortResponse{Port: port}, err
 	}
-	err = s.LookupPort(ip, port)
+	// Probes always connect back to the requesting address; the ?ip=
+	// parameter is intentionally ignored. Source and target are therefore
+	// the same address, but both are passed so per-source and per-target
+	// policy limits can be enforced independently.
+	err = s.ProbePort(ip, ip, port)
+	if err != nil {
+		var guardErr *outbound.GuardError
+		if errors.As(err, &guardErr) {
+			// Policy rejections are surfaced as HTTP errors by the caller.
+			return PortResponse{IP: ip, Port: port}, err
+		}
+	}
 
 	status := PortUnknown
 	if err == nil {
@@ -315,9 +333,35 @@ func (s *Server) HeadHandler(w http.ResponseWriter, r *http.Request) *appError {
 func (s *Server) PortHandler(w http.ResponseWriter, r *http.Request) *appError {
 	response, err := s.newPortResponse(r)
 	if err != nil {
+		var guardErr *outbound.GuardError
+		if errors.As(err, &guardErr) {
+			code := http.StatusForbidden
+			switch guardErr.Kind {
+			case outbound.KindRate:
+				code = http.StatusTooManyRequests
+			case outbound.KindConcurrency:
+				code = http.StatusServiceUnavailable
+			}
+			return &appError{
+				Error:       err,
+				Message:     guardErr.Error(),
+				Code:        code,
+				ContentType: jsonMediaType,
+			}
+		}
 		return badRequest(err).WithMessage(err.Error()).AsJSON()
 	}
 	b, err := json.MarshalIndent(response, "", "  ")
+	if err != nil {
+		return internalServerError(err).AsJSON()
+	}
+	w.Header().Set("Content-Type", jsonMediaType)
+	w.Write(b)
+	return nil
+}
+
+func (s *Server) portStatsHandler(w http.ResponseWriter, r *http.Request) *appError {
+	b, err := json.MarshalIndent(s.PortStats(), "", "  ")
 	if err != nil {
 		return internalServerError(err).AsJSON()
 	}
@@ -404,7 +448,7 @@ func (s *Server) DefaultHandler(w http.ResponseWriter, r *http.Request) *appErro
 		response.Longitude - 0.05,
 		response.Longitude + 0.05,
 		string(json),
-		s.LookupPort != nil,
+		s.ProbePort != nil,
 		s.Sponsor,
 		!s.NoCustomIP && r.URL.Query().Has("ip"),
 		s.NoCustomIP,
@@ -499,7 +543,7 @@ func (s *Server) Handler() http.Handler {
 	}
 
 	// Port testing
-	if s.LookupPort != nil {
+	if s.ProbePort != nil {
 		r.RoutePrefix("GET", "/port/", s.PortHandler)
 	}
 
@@ -507,6 +551,9 @@ func (s *Server) Handler() http.Handler {
 	if s.profile {
 		r.Route("POST", "/debug/cache/resize", s.cacheResizeHandler)
 		r.Route("GET", "/debug/cache/", s.cacheHandler)
+		if s.PortStats != nil {
+			r.Route("GET", "/debug/port/", s.portStatsHandler)
+		}
 		r.Route("GET", "/debug/pprof/cmdline", wrapHandlerFunc(pprof.Cmdline))
 		r.Route("GET", "/debug/pprof/profile", wrapHandlerFunc(pprof.Profile))
 		r.Route("GET", "/debug/pprof/symbol", wrapHandlerFunc(pprof.Symbol))

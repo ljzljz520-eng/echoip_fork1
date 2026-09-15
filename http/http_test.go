@@ -11,10 +11,11 @@ import (
 	"testing"
 
 	"github.com/mpolden/echoip/iputil/geo"
+	"github.com/mpolden/echoip/outbound"
 )
 
-func lookupAddr(net.IP) (string, error) { return "localhost", nil }
-func lookupPort(net.IP, uint64) error   { return nil }
+func lookupAddr(net.IP) (string, error)      { return "localhost", nil }
+func probePort(net.IP, net.IP, uint64) error { return nil }
 
 type testDb struct{}
 type ipTestCase struct {
@@ -40,7 +41,7 @@ func (t *testDb) ASN(net.IP) (geo.ASN, error) {
 func (t *testDb) IsEmpty() bool { return false }
 
 func testServer() *Server {
-	return &Server{cache: NewCache(100), gr: &testDb{}, LookupAddr: lookupAddr, LookupPort: lookupPort}
+	return &Server{cache: NewCache(100), gr: &testDb{}, LookupAddr: lookupAddr, ProbePort: probePort}
 }
 
 func httpGet(url string, acceptMediaType string, userAgent string) (string, int, error) {
@@ -121,7 +122,7 @@ func TestCLIHandlers(t *testing.T) {
 func TestDisabledHandlers(t *testing.T) {
 	log.SetOutput(ioutil.Discard)
 	server := testServer()
-	server.LookupPort = nil
+	server.ProbePort = nil
 	server.LookupAddr = nil
 	server.gr, _ = geo.Open("", "", "")
 	s := httptest.NewServer(server.Handler())
@@ -213,6 +214,62 @@ func TestCacheResizeHandler(t *testing.T) {
 	want := "{\n  \"message\": \"Changed cache capacity to 10.\"\n}"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestPortGuardDenials(t *testing.T) {
+	var tests = []struct {
+		name   string
+		kind   outbound.Kind
+		status int
+	}{
+		{"policy", outbound.KindPolicy, http.StatusForbidden},
+		{"rate", outbound.KindRate, http.StatusTooManyRequests},
+		{"concurrency", outbound.KindConcurrency, http.StatusServiceUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := testServer()
+			kind := tt.kind
+			srv.ProbePort = func(net.IP, net.IP, uint64) error {
+				return &outbound.GuardError{Kind: kind, Scope: "test", Reason: "denied in test"}
+			}
+			s := httptest.NewServer(srv.Handler())
+			defer s.Close()
+			out, status, err := httpGet(s.URL+"/port/80", jsonMediaType, "curl/7.2.6.0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != tt.status {
+				t.Errorf("Expected %d, got %d (%s)", tt.status, status, out)
+			}
+			if !strings.Contains(out, "outbound probe denied") {
+				t.Errorf("Expected denial message, got %q", out)
+			}
+		})
+	}
+}
+
+func TestPortStatsHandler(t *testing.T) {
+	log.SetOutput(ioutil.Discard)
+	srv := testServer()
+	srv.profile = true
+	srv.PortStats = func() outbound.Stats {
+		return outbound.Stats{Attempts: 3, Succeeded: 2, Failed: 1, FailureRate: 1.0 / 3.0}
+	}
+	s := httptest.NewServer(srv.Handler())
+	defer s.Close()
+	out, status, err := httpGet(s.URL+"/debug/port/", jsonMediaType, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("Expected 200, got %d (%s)", status, out)
+	}
+	for _, fragment := range []string{`"attempts_total": 3`, `"succeeded_total": 2`, `"failed_total": 1`, `"failure_rate": 0.3333333333333333`} {
+		if !strings.Contains(out, fragment) {
+			t.Errorf("Expected response to contain %s, got %q", fragment, out)
+		}
 	}
 }
 
